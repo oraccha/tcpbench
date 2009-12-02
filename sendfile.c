@@ -8,12 +8,15 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 
 #define PORT (10000)
 #define MIN(a, b)	((a) < (b) ? (a) : (b))
 
+static int direct;
 double wtime();
 
 void
@@ -138,11 +141,13 @@ do_sendfile(int fromfd, int tofd, loff_t *offset, size_t count)
   return total;
 }
 
+/* splice version. */
+
 int
 do_recvfile(int fromfd, int tofd, loff_t *offset, size_t count)
 {
   int pipefd[2];
-  long rc, wc, nread, nwrite;
+  long rc, wc, nread, nwrite, total;
   loff_t off = 0;
   int cc;
 
@@ -176,9 +181,58 @@ do_recvfile(int fromfd, int tofd, loff_t *offset, size_t count)
       wc -= nwrite;
     }
     rc -= nread;
+    total += nread;
   }
 
-  return 0;
+  return total;
+}
+
+/* read/write version. */
+
+int
+do_recvfile2(int fromfd, int tofd, loff_t *offset, size_t count)
+{
+  long rc, wc, nread, nwrite, total = 0;
+  char *rcvbuf;
+  int cc;
+  int bufsiz = 4096 * 20;
+
+  if (direct) {
+    cc = posix_memalign((void **)&rcvbuf, getpagesize(), bufsiz);
+    if (cc < 0) {
+      perror("posix_memalign");
+      return -1;
+    }
+  } else {
+    rcvbuf = malloc(bufsiz);
+    if (rcvbuf == NULL) {
+      perror("malloc");
+      return -1;
+    }
+  }
+    
+  rc = count;
+  while (rc > 0) {
+    nread = read(fromfd, rcvbuf, bufsiz);
+    if (nread < 0) {
+      perror("read");
+      return -1;
+    }
+
+    wc = nread;
+    while (wc > 0) {
+      nwrite = write(tofd, rcvbuf + (nread - wc), wc);
+      if (nwrite < 0) {
+	perror("write");
+	return -1;
+      }
+      wc -= nwrite;
+    }
+    rc -= nread;
+    total += nread;
+  }
+
+  return total;
 }
 
 int
@@ -186,9 +240,10 @@ main(int argc, char **argv)
 {
   struct stat s;
   int fromfd, tofd;
+  ssize_t fsiz;
   int cc;
   double start, end;
-  int direct, sink, port;
+  int sink, port = PORT;
   int flag;
 
   argc--;
@@ -218,7 +273,6 @@ main(int argc, char **argv)
     /* RECEIVER SIDE */
     struct sockaddr_in sa;
     socklen_t salen;
-    ssize_t len;
     int lfd;
 
     if (argc != 1) {
@@ -247,12 +301,12 @@ main(int argc, char **argv)
     salen = sizeof(sa);
     fromfd = accept(lfd, (struct sockaddr *)&sa, &salen);
 
-    cc = read(fromfd, &len, sizeof(len));
+    cc = read(fromfd, &fsiz, sizeof(fsiz));
     if (cc < 0)
       perror_exit("read", 1);
 
     start = wtime();
-    cc = do_recvfile(fromfd, tofd, NULL, len);
+    cc = do_recvfile2(fromfd, tofd, NULL, fsiz);
     if (cc < 0)
       exit(1);
     end = wtime();
@@ -262,13 +316,13 @@ main(int argc, char **argv)
       perror_exit("fstat", 1);
 
     printf("%s (%ld bytes)\t%g MB/sec\n",
-	   argv[0], len, ((double)len / (end - start) / 1.0e6));
+	   argv[0], fsiz, ((double)fsiz / (end - start) / 1.0e6));
 
     close(fromfd);
     close(tofd);
   } else {
     /* SENDER SIDE */
-    long fsize, nsend;
+    long nsend;
 
     if (argc != 2) {
       usage();
@@ -290,11 +344,13 @@ main(int argc, char **argv)
     if (cc < 0)
       perror_exit("fstat", 1);
 
-    fsize = s.st_size;
-    write(tofd, &fsize, sizeof(fsize));
+    fsiz = s.st_size;
+    cc = write(tofd, &fsiz, sizeof(fsiz));
+    if (cc < 0)
+      perror_exit("write(fsiz)", 1);
 
     start = wtime();
-    nsend = do_sendfile(fromfd, tofd, NULL, fsize);
+    nsend = do_sendfile(fromfd, tofd, NULL, fsiz);
     if (nsend < 0)
       exit(1);
     end = wtime();
