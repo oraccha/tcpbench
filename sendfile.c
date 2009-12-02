@@ -1,0 +1,333 @@
+#define _LARGEFILE64_SOURCE
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/sendfile.h>
+#include <sys/socket.h>
+
+#define PORT (10000)
+#define MIN(a, b)	((a) < (b) ? (a) : (b))
+
+double wtime();
+
+void
+usage()
+{
+  printf("usage:\n");
+  printf(" sender:   sendfile OPTIONS remotehost filename\n");
+  printf(" receiver: sendfile OPTIONS -sink filename\n");
+  printf("OPTIONS:\n");
+  printf(" -direct        specify to use direct I/O\n");
+  printf(" -port <port>   specify the port number\n");
+}
+
+inline void
+perror_exit(const char *s, int status)
+{
+  perror(s);
+  exit(status);
+}
+
+int active_open(const char *host, const int port)
+{
+  struct sockaddr_in sa;
+  struct hostent *he;
+  int fd;
+  int cc;
+  int one = 1;
+
+  he = gethostbyname(host);
+  if (he == NULL) {
+    perror("gethostbyname");
+    return -1;
+  }
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = he->h_addrtype;
+  memcpy(&sa.sin_addr.s_addr, he->h_addr_list[0], 4);
+  sa.sin_port = htons(port);
+
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  cc = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one));
+  if (cc < 0) {
+    perror("WARN: setsockopt(SO_REUSEADDR)");
+    /* Ignore setsockopt error. */
+  }
+
+  cc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+  if (cc < 0) {
+    perror("connect");
+    return -1;
+  }
+
+  return fd;
+}
+
+int passive_open(const int port)
+{
+  struct sockaddr_in sa;
+  socklen_t salen;
+  int fd;
+  int cc;
+  int one = 1;
+
+  fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    perror("socket");
+    return -1;
+  }
+
+  cc = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one));
+  if (cc < 0) {
+    perror("WARN: setsockopt(SO_REUSEADDR)");
+    /* Ignore setsockopt error. */
+  }
+
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  sa.sin_addr.s_addr = htonl(INADDR_ANY);
+  sa.sin_port = htons(port);
+  salen = sizeof(sa);
+
+  cc = bind(fd, (struct sockaddr *)&sa, salen);
+  if (cc < 0) {
+    perror("bind");
+    return -1;
+  }
+
+  cc = listen(fd, 0);
+  if (cc < 0) {
+    perror("listen");
+    return -1;
+  }
+
+  return fd;
+}
+
+long
+do_sendfile(int fromfd, int tofd, loff_t *offset, size_t count)
+{
+  long c, n, total = 0;
+  loff_t off = 0;
+
+  if (offset == NULL)
+    offset = &off;
+
+  c = count;
+  while (c > 0) {
+    n = sendfile(tofd, fromfd, offset, c);
+    if (n < 0) {
+      perror("sendfile");
+      return -1;
+    }
+    c -= n;
+    total += n;
+  }
+
+  return total;
+}
+
+int
+do_recvfile(int fromfd, int tofd, loff_t *offset, size_t count)
+{
+  int pipefd[2];
+  long rc, wc, nread, nwrite;
+  loff_t off = 0;
+  int cc;
+
+  if (offset == NULL)
+    offset = &off;
+
+  cc = pipe(pipefd);
+  if (cc < 0) {
+    perror("pipe");
+    return -1;
+  }
+
+  rc = count;
+  while (rc > 0) {
+    /* {len} is bound upto 16384, because the process blocks forever
+     * when setting large number to it. */
+    nread = splice(fromfd, NULL, pipefd[1], NULL, MIN(rc, 16384),
+		   SPLICE_F_MOVE);
+    if (nread < 0) {
+      perror("splice(socket to pipe)");
+      return -1;
+    }
+
+    wc = nread;
+    while (wc > 0) {
+      nwrite = splice(pipefd[0], NULL, tofd, offset, wc, SPLICE_F_MOVE);
+      if (nwrite < 0) {
+	perror("splice(pipe to file)");
+	return -1;
+      }
+      wc -= nwrite;
+    }
+    rc -= nread;
+  }
+
+  return 0;
+}
+
+int
+main(int argc, char **argv)
+{
+  struct stat s;
+  int fromfd, tofd;
+  int cc;
+  double start, end;
+  int direct, sink, port;
+  int flag;
+
+  argc--;
+  argv++;
+  while (argc > 0) {
+    if (strncmp(argv[0], "-direct", 7) == 0) {
+      direct = 1;
+      argc--;
+      argv++;
+    } else if (strncmp(argv[0], "-sink", 5) == 0) {
+      sink = 1;
+      argc--;
+      argv++;
+    } else if (strncmp(argv[0], "-port", 5) == 0) {
+      char *p;
+      port = strtoul(argv[1], &p, 10);
+      if (p == argv[1])
+	port = PORT;
+
+      argc -= 2;
+      argv += 2;
+    } else
+      break;
+  }
+
+  if (sink) {
+    /* RECEIVER SIDE */
+    struct sockaddr_in sa;
+    socklen_t salen;
+    ssize_t len;
+    int lfd;
+
+    if (argc != 1) {
+      usage();
+      exit(1);
+    }
+
+    cc = stat(argv[0], &s);
+    if (cc == 0) {
+      cc = unlink(argv[0]);
+      if (cc < 0)
+	perror_exit("unlink", 1);
+    }
+
+    flag = O_RDWR|O_CREAT;
+    if (direct)
+      flag |= O_DIRECT;
+    tofd = open(argv[0], flag, 0666);
+    if (tofd < 0)
+      perror_exit("open", 1);
+
+    lfd = passive_open(port);
+    if (cc < 0)
+      exit(1);
+
+    salen = sizeof(sa);
+    fromfd = accept(lfd, (struct sockaddr *)&sa, &salen);
+
+    cc = read(fromfd, &len, sizeof(len));
+    if (cc < 0)
+      perror_exit("read", 1);
+
+    start = wtime();
+    cc = do_recvfile(fromfd, tofd, NULL, len);
+    if (cc < 0)
+      exit(1);
+    end = wtime();
+
+    cc = fstat(tofd, &s);
+    if (cc < 0)
+      perror_exit("fstat", 1);
+
+    printf("%s (%ld bytes)\t%g MB/sec\n",
+	   argv[0], len, ((double)len / (end - start) / 1.0e6));
+
+    close(fromfd);
+    close(tofd);
+  } else {
+    /* SENDER SIDE */
+    long fsize, nsend;
+
+    if (argc != 2) {
+      usage();
+      exit(1);
+    }
+
+    tofd = active_open(argv[0], port);
+    if (tofd < 0)
+      exit(1);
+
+    flag = O_RDONLY;
+    if (direct)
+      flag |= O_DIRECT;
+    fromfd = open(argv[1], flag);
+    if (fromfd < 0)
+      perror_exit("open", 1);
+
+    cc = fstat(fromfd, &s);
+    if (cc < 0)
+      perror_exit("fstat", 1);
+
+    fsize = s.st_size;
+    write(tofd, &fsize, sizeof(fsize));
+
+    start = wtime();
+    nsend = do_sendfile(fromfd, tofd, NULL, fsize);
+    if (nsend < 0)
+      exit(1);
+    end = wtime();
+
+    printf("%s (%ld bytes)\t%g MB/sec\n",
+	   argv[1], nsend, ((double)nsend / (end - start) / 1.0e6));
+
+    close(fromfd);
+    close(tofd);
+  }
+
+  return 0;
+}
+
+double
+wtime()
+{
+  struct timeval tv;
+  int cc;
+  static struct timeval tv0;
+
+  if (tv0.tv_sec == 0) {
+    cc = gettimeofday(&tv, 0);
+    if (cc != 0)
+      perror_exit("gettimeofday", 1);
+    tv0 = tv;
+    return 0.0;
+  }
+
+  cc = gettimeofday(&tv, 0);
+  if (cc != 0)
+    perror_exit("gettimeofday", 1);
+
+  return (((double)(tv.tv_sec - tv0.tv_sec))
+	  + ((double)(tv.tv_usec - tv0.tv_usec)) * 1e-6);
+}
