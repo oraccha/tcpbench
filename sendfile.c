@@ -12,12 +12,25 @@
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
+#include <assert.h>
 
 #define PORT (10000)
 #define MIN(a, b)	((a) < (b) ? (a) : (b))
+#define ALIGN(a, b)	(((a) + ((b) - 1)) & (~((b) - 1)))
 
 static int direct;
+int do_recvfile_splice(int fromfd, int tofd, loff_t *offset, size_t count);
+int do_recvfile_rw(int fromfd, int tofd, loff_t *offset, size_t count);
 double wtime();
+
+struct functab {
+  char *name;
+  int (*func)(int, int, loff_t *, size_t);
+} recvfiles[] = {
+  { "splice",	do_recvfile_splice },
+  { "rw",	do_recvfile_rw },
+  { 0, 0 }
+};
 
 void
 usage()
@@ -26,8 +39,11 @@ usage()
   printf(" sender:   sendfile OPTIONS remotehost filename\n");
   printf(" receiver: sendfile OPTIONS -sink filename\n");
   printf("OPTIONS:\n");
-  printf(" -direct        specify to use direct I/O\n");
-  printf(" -port <port>   specify the port number\n");
+  printf(" -direct           specify to use direct I/O\n");
+  printf(" -port <port>      specify the port number\n");
+  printf(" -recv [splice|rw] specify recvfile method (receiver only)\n");
+  printf(" -once             specify to run in one-shot (receiver only)\n");
+  printf(" -help             display this message\n");
 }
 
 inline void
@@ -144,7 +160,7 @@ do_sendfile(int fromfd, int tofd, loff_t *offset, size_t count)
 /* splice version. */
 
 int
-do_recvfile(int fromfd, int tofd, loff_t *offset, size_t count)
+do_recvfile_splice(int fromfd, int tofd, loff_t *offset, size_t count)
 {
   int pipefd[2];
   long rc, wc, nread, nwrite, total;
@@ -190,14 +206,17 @@ do_recvfile(int fromfd, int tofd, loff_t *offset, size_t count)
 /* read/write version. */
 
 int
-do_recvfile2(int fromfd, int tofd, loff_t *offset, size_t count)
+do_recvfile_rw(int fromfd, int tofd, loff_t *offset, size_t count)
 {
-  long rc, wc, nread, nwrite, total = 0;
+  long rc, nread, nwrite, total = 0;
   char *rcvbuf;
   int cc;
   int bufsiz = 4096 * 20;
 
   if (direct) {
+    fprintf(stderr, "Not implement direct IO mode.");
+    exit(1);
+
     cc = posix_memalign((void **)&rcvbuf, getpagesize(), bufsiz);
     if (cc < 0) {
       perror("posix_memalign");
@@ -210,7 +229,7 @@ do_recvfile2(int fromfd, int tofd, loff_t *offset, size_t count)
       return -1;
     }
   }
-    
+
   rc = count;
   while (rc > 0) {
     nread = read(fromfd, rcvbuf, bufsiz);
@@ -219,15 +238,13 @@ do_recvfile2(int fromfd, int tofd, loff_t *offset, size_t count)
       return -1;
     }
 
-    wc = nread;
-    while (wc > 0) {
-      nwrite = write(tofd, rcvbuf + (nread - wc), wc);
-      if (nwrite < 0) {
-	perror("write");
-	return -1;
-      }
-      wc -= nwrite;
+    nwrite = write(tofd, rcvbuf, nread);
+    if (nwrite < 0) {
+      perror("write");
+      return -1;
     }
+    assert(nread == nwrite);
+
     rc -= nread;
     total += nread;
   }
@@ -244,6 +261,8 @@ main(int argc, char **argv)
   int cc;
   double start, end;
   int sink, port = PORT;
+  int once = 0;
+  int (*do_recvfile)(int, int, loff_t *, size_t) = do_recvfile_splice;
   int flag;
 
   argc--;
@@ -257,6 +276,21 @@ main(int argc, char **argv)
       sink = 1;
       argc--;
       argv++;
+    } else if (strncmp(argv[0], "-once", 5) == 0) {
+      once = 1;
+      argc--;
+      argv++;
+    } else if (strncmp(argv[0], "-recv", 5) == 0) {
+      int i;
+      for (i = 0; recvfiles[i].name != 0; i++) {
+	if (strncmp(argv[1], recvfiles[i].name,
+		    strlen(recvfiles[i].name)) == 0) {
+	  do_recvfile = recvfiles[i].func;
+	  break;
+	}
+      }
+      argc -= 2;
+      argv += 2;
     } else if (strncmp(argv[0], "-port", 5) == 0) {
       char *p;
       port = strtoul(argv[1], &p, 10);
@@ -265,6 +299,10 @@ main(int argc, char **argv)
 
       argc -= 2;
       argv += 2;
+    } else if (strncmp(argv[0], "-help", 5) == 0 ||
+	       strncmp(argv[0], "-h", 2) == 0) {
+      usage();
+      exit(0);
     } else
       break;
   }
@@ -287,7 +325,7 @@ main(int argc, char **argv)
 	perror_exit("unlink", 1);
     }
 
-    flag = O_RDWR|O_CREAT;
+    flag = O_RDWR | O_CREAT;
     if (direct)
       flag |= O_DIRECT;
     tofd = open(argv[0], flag, 0666);
@@ -298,27 +336,30 @@ main(int argc, char **argv)
     if (cc < 0)
       exit(1);
 
-    salen = sizeof(sa);
-    fromfd = accept(lfd, (struct sockaddr *)&sa, &salen);
+    do {
+      salen = sizeof(sa);
+      fromfd = accept(lfd, (struct sockaddr *)&sa, &salen);
 
-    cc = read(fromfd, &fsiz, sizeof(fsiz));
-    if (cc < 0)
-      perror_exit("read", 1);
+      cc = read(fromfd, &fsiz, sizeof(fsiz));
+      if (cc < 0)
+	perror_exit("read", 1);
 
-    start = wtime();
-    cc = do_recvfile2(fromfd, tofd, NULL, fsiz);
-    if (cc < 0)
-      exit(1);
-    end = wtime();
+      start = wtime();
+      cc = do_recvfile(fromfd, tofd, NULL, fsiz);
+      if (cc < 0)
+	exit(1);
+      end = wtime();
 
-    cc = fstat(tofd, &s);
-    if (cc < 0)
-      perror_exit("fstat", 1);
+      cc = fstat(tofd, &s);
+      if (cc < 0)
+	perror_exit("fstat", 1);
 
-    printf("%s (%ld bytes)\t%g MB/sec\n",
-	   argv[0], fsiz, ((double)fsiz / (end - start) / 1.0e6));
+      printf("%s (%ld bytes)\t%g MB/sec\n",
+	     argv[0], fsiz, ((double)fsiz / (end - start) / 1.0e6));
 
-    close(fromfd);
+      close(fromfd);
+    } while (!once);
+
     close(tofd);
   } else {
     /* SENDER SIDE */
